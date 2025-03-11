@@ -20,6 +20,10 @@ void proc_b_entry(void);
 void yield(void);
 void map_page(uint32_t *table1, uint32_t vaddr, paddr_t paddr, uint32_t flags);
 paddr_t alloc_pages(uint32_t n);
+
+__attribute__((naked)) void user_entry(void);
+__attribute__((naked)) void switch_context(uint32_t *prev_sp,uint32_t *next_sp);
+
 // void *memset(void *buf, char c, size_t n) {
 //     uint8_t *p = (uint8_t *) buf;
 //     while (n--)
@@ -64,8 +68,12 @@ struct process *current_proc; // 当前运行的进程
 struct process *idle_proc;    // 空闲进程
 
 struct process procs[PROCS_MAX]; // 所有进程控制结构
+
+// void user_entry(void) {
+//     PANIC("not yet implemented");
+// }
 // 进程初始化
-struct process *create_process(uint32_t pc) {
+struct process *create_process(const void *image, size_t image_size) {
     // 查找未使用的进程控制结构
     struct process *proc = NULL;
     int i;
@@ -94,14 +102,29 @@ struct process *create_process(uint32_t pc) {
     *--sp = 0;                      // s2
     *--sp = 0;                      // s1
     *--sp = 0;                      // s0
-    *--sp = (uint32_t) pc;          // ra
+    *--sp = (uint32_t) user_entry;  // ra (已更改!)
 
-    // // 映射内核页面。
+    // 映射内核页面。
     uint32_t *page_table = (uint32_t *) alloc_pages(1);
     for (paddr_t paddr = (paddr_t) __kernel_base;
         paddr < (paddr_t) __free_ram_end; paddr += PAGE_SIZE)
         map_page(page_table, paddr, paddr, PAGE_R | PAGE_W | PAGE_X);
     
+    // 映射用户页。
+    for (uint32_t off = 0; off < image_size; off += PAGE_SIZE) {
+        paddr_t page = alloc_pages(1);
+
+        // 处理要复制的数据小于页面大小的情况。
+        size_t remaining = image_size - off;
+        size_t copy_size = PAGE_SIZE <= remaining ? PAGE_SIZE : remaining;
+
+        // 填充并映射页面。
+        memcpy((void *) page, image + off, copy_size);
+        map_page(page_table, USER_BASE + off, page,
+                 PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+    }
+
+
     // 初始化字段
     proc->pid = i + 1;
     proc->state = PROC_RUNNABLE;
@@ -154,12 +177,14 @@ void kernel_main(void) {
     WRITE_CSR(stvec, (uint32_t)kernel_entry); // 新增
     
 
-    idle_proc = create_process((uint32_t) NULL);
+    idle_proc = create_process(NULL, 0); // 已更新!
     idle_proc->pid = 0; // idle
     current_proc = idle_proc;
 
-    proc_a = create_process((uint32_t) proc_a_entry);
-    proc_b = create_process((uint32_t) proc_b_entry);
+
+    create_process(_binary_shell_bin_start, (size_t) _binary_shell_bin_size);
+    // proc_a = create_process((uint32_t) proc_a_entry);
+    // proc_b = create_process((uint32_t) proc_b_entry);
     // proc_a_entry();
     
     yield();
@@ -211,6 +236,19 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
         "lw s11, 12 * 4(sp)\n"
         "addi sp, sp, 13 * 4\n"  // 我们已从栈中弹出13个4字节寄存器
         "ret\n"
+    );
+}
+
+
+// ↓ __attribute__((naked)) 非常重要!
+__attribute__((naked)) void user_entry(void) {
+    __asm__ __volatile__(
+        "csrw sepc, %[sepc]        \n"
+        "csrw sstatus, %[sstatus]  \n"
+        "sret                      \n"
+        :
+        : [sepc] "r" (USER_BASE),
+          [sstatus] "r" (SSTATUS_SPIE)
     );
 }
 
