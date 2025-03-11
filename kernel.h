@@ -43,6 +43,10 @@
 
 #define SSTATUS_SPIE (1 << 5)
 
+#define SCAUSE_ECALL 8
+
+#define PROC_EXITED   2
+
 // 全局变量声明
 extern char __bss[], __bss_end[], __stack_top[];
 extern char __kernel_base[]; // 内核基址
