@@ -125,6 +125,8 @@ struct process *create_process(const void *image, size_t image_size) {
         memcpy((void *) page, image + off, copy_size);
         map_page(page_table, USER_BASE + off, page,
                  PAGE_U | PAGE_R | PAGE_W | PAGE_X);
+
+        map_page(page_table, VIRTIO_BLK_PADDR, VIRTIO_BLK_PADDR, PAGE_R | PAGE_W); // new
     }
 
 
@@ -166,6 +168,230 @@ paddr_t alloc_pages(uint32_t n) {
 //     }
 // }
 
+// mmio 寄存器访问函数
+uint32_t virtio_reg_read32(unsigned offset) {
+    return *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+uint64_t virtio_reg_read64(unsigned offset) {
+    return *((volatile uint64_t *) (VIRTIO_BLK_PADDR + offset));
+}
+
+void virtio_reg_write32(unsigned offset, uint32_t value) {
+    *((volatile uint32_t *) (VIRTIO_BLK_PADDR + offset)) = value;
+}
+
+void virtio_reg_fetch_and_or32(unsigned offset, uint32_t value) {
+    virtio_reg_write32(offset, virtio_reg_read32(offset) | value);
+}
+
+// virtqueue 初始化
+struct virtio_virtq *virtq_init(unsigned index) {
+    // 为 virtqueue 分配一个区域。
+    paddr_t virtq_paddr = alloc_pages(align_up(sizeof(struct virtio_virtq), PAGE_SIZE) / PAGE_SIZE);
+    struct virtio_virtq *vq = (struct virtio_virtq *) virtq_paddr;
+    vq->queue_index = index;
+    vq->used_index = (volatile uint16_t *) &vq->used.index;
+    // 1. 通过写入队列的索引(第一个队列为 0)到 QueueSel 来选择队列。
+    virtio_reg_write32(VIRTIO_REG_QUEUE_SEL, index);
+    // 5. 通过写入大小到 QueueNum 来通知设备队列大小。
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NUM, VIRTQ_ENTRY_NUM);
+    // 6. 通过写入其字节值到 QueueAlign 来通知设备已使用的对齐方式。
+    virtio_reg_write32(VIRTIO_REG_QUEUE_ALIGN, 0);
+    // 7. 将队列第一页的物理编号写入 QueuePFN 寄存器。
+    virtio_reg_write32(VIRTIO_REG_QUEUE_PFN, virtq_paddr);
+    return vq;
+}
+
+// virtio 初始化
+struct virtio_virtq *blk_request_vq;
+struct virtio_blk_req *blk_req;
+paddr_t blk_req_paddr;
+unsigned blk_capacity;
+
+void virtio_blk_init(void) {
+    if (virtio_reg_read32(VIRTIO_REG_MAGIC) != 0x74726976)
+        PANIC("virtio: invalid magic value");
+    if (virtio_reg_read32(VIRTIO_REG_VERSION) != 1)
+        PANIC("virtio: invalid version");
+    if (virtio_reg_read32(VIRTIO_REG_DEVICE_ID) != VIRTIO_DEVICE_BLK)
+        PANIC("virtio: invalid device id");
+
+    // 1. 重置设备。
+    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, 0);
+    // 2. 设置 ACKNOWLEDGE 状态位：表示客户操作系统已注意到该设备。
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_ACK);
+    // 3. 设置 DRIVER 状态位。
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER);
+    // 5. 设置 FEATURES_OK 状态位。
+    virtio_reg_fetch_and_or32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_FEAT_OK);
+    // 7. 执行设备特定的设置，包括发现设备的 virtqueues
+    blk_request_vq = virtq_init(0);
+    // 8. 设置 DRIVER_OK 状态位。
+    virtio_reg_write32(VIRTIO_REG_DEVICE_STATUS, VIRTIO_STATUS_DRIVER_OK);
+
+    // 获取磁盘容量。
+    blk_capacity = virtio_reg_read64(VIRTIO_REG_DEVICE_CONFIG + 0) * SECTOR_SIZE;
+    printf("virtio-blk: capacity is %d bytes\n", blk_capacity);
+
+    // 分配一个区域来存储对设备的请求。
+    blk_req_paddr = alloc_pages(align_up(sizeof(*blk_req), PAGE_SIZE) / PAGE_SIZE);
+    blk_req = (struct virtio_blk_req *) blk_req_paddr;
+}
+
+// I/O请求发送
+// 通知设备有新的请求。`desc_index` 是新请求头描述符的索引。
+void virtq_kick(struct virtio_virtq *vq, int desc_index) {
+    vq->avail.ring[vq->avail.index % VIRTQ_ENTRY_NUM] = desc_index;
+    vq->avail.index++;
+    __sync_synchronize();
+    virtio_reg_write32(VIRTIO_REG_QUEUE_NOTIFY, vq->queue_index);
+    vq->last_used_index++;
+}
+
+// 返回是否有请求正在被设备处理。
+bool virtq_is_busy(struct virtio_virtq *vq) {
+    return vq->last_used_index != *vq->used_index;
+}
+
+// 从 virtio-blk 设备读取/写入。
+void read_write_disk(void *buf, unsigned sector, int is_write) {
+    if (sector >= blk_capacity / SECTOR_SIZE) {
+        printf("virtio: tried to read/write sector=%d, but capacity is %d\n",
+              sector, blk_capacity / SECTOR_SIZE);
+        return;
+    }
+
+    // 根据 virtio-blk 规范构造请求。
+    blk_req->sector = sector;
+    blk_req->type = is_write ? VIRTIO_BLK_T_OUT : VIRTIO_BLK_T_IN;
+    if (is_write)
+        memcpy(blk_req->data, buf, SECTOR_SIZE);
+
+    // 构造 virtqueue 描述符(使用 3 个描述符)。
+    struct virtio_virtq *vq = blk_request_vq;
+    vq->descs[0].addr = blk_req_paddr;
+    vq->descs[0].len = sizeof(uint32_t) * 2 + sizeof(uint64_t);
+    vq->descs[0].flags = VIRTQ_DESC_F_NEXT;
+    vq->descs[0].next = 1;
+
+    vq->descs[1].addr = blk_req_paddr + offsetof(struct virtio_blk_req, data);
+    vq->descs[1].len = SECTOR_SIZE;
+    vq->descs[1].flags = VIRTQ_DESC_F_NEXT | (is_write ? 0 : VIRTQ_DESC_F_WRITE);
+    vq->descs[1].next = 2;
+
+    vq->descs[2].addr = blk_req_paddr + offsetof(struct virtio_blk_req, status);
+    vq->descs[2].len = sizeof(uint8_t);
+    vq->descs[2].flags = VIRTQ_DESC_F_WRITE;
+
+    // 通知设备有新的请求。
+    virtq_kick(vq, 0);
+
+    // 等待设备完成处理。
+    while (virtq_is_busy(vq))
+        ;
+
+    // virtio-blk：如果返回非零值，则表示错误。
+    if (blk_req->status != 0) {
+        printf("virtio: warn: failed to read/write sector=%d status=%d\n",
+               sector, blk_req->status);
+        return;
+    }
+
+    // 对于读操作，将数据复制到缓冲区。
+    if (!is_write)
+        memcpy(buf, blk_req->data, SECTOR_SIZE);
+}
+
+// 磁盘读入内存
+struct file files[FILES_MAX];
+uint8_t disk[DISK_MAX_SIZE];
+
+int oct2int(char *oct, int len) {
+    int dec = 0;
+    for (int i = 0; i < len; i++) {
+        if (oct[i] < '0' || oct[i] > '7')
+            break;
+
+        dec = dec * 8 + (oct[i] - '0');
+    }
+    return dec;
+}
+
+void fs_init(void) {
+    for (unsigned sector = 0; sector < sizeof(disk) / SECTOR_SIZE; sector++)
+        read_write_disk(&disk[sector * SECTOR_SIZE], sector, false);
+
+    unsigned off = 0;
+    for (int i = 0; i < FILES_MAX; i++) {
+        struct tar_header *header = (struct tar_header *) &disk[off];
+        if (header->name[0] == '\0')
+            break;
+
+        if (strcmp(header->magic, "ustar") != 0)
+            PANIC("invalid tar header: magic=\"%s\"", header->magic);
+
+        int filesz = oct2int(header->size, sizeof(header->size));
+        struct file *file = &files[i];
+        file->in_use = true;
+        strcpy(file->name, header->name);
+        memcpy(file->data, header->data, filesz);
+        file->size = filesz;
+        printf("file: %s, size=%d\n", file->name, file->size);
+
+        off += align_up(sizeof(struct tar_header) + filesz, SECTOR_SIZE);
+    }
+}
+
+// 磁盘写入
+
+void fs_flush(void) {
+    // 将所有文件内容复制到 `disk` 缓冲区
+    memset(disk, 0, sizeof(disk));
+    unsigned off = 0;
+    for (int file_i = 0; file_i < FILES_MAX; file_i++) {
+        struct file *file = &files[file_i];
+        if (!file->in_use)
+            continue;
+
+        struct tar_header *header = (struct tar_header *) &disk[off];
+        memset(header, 0, sizeof(*header));
+        strcpy(header->name, file->name);
+        strcpy(header->mode, "000644");
+        strcpy(header->magic, "ustar");
+        strcpy(header->version, "00");
+        header->type = '0';
+
+        // 将文件大小转换为八进制字符串
+        int filesz = file->size;
+        for (int i = sizeof(header->size); i > 0; i--) {
+            header->size[i - 1] = (filesz % 8) + '0';
+            filesz /= 8;
+        }
+
+        // 计算校验和
+        int checksum = ' ' * sizeof(header->checksum);
+        for (unsigned i = 0; i < sizeof(struct tar_header); i++)
+            checksum += (unsigned char) disk[off + i];
+
+        for (int i = 5; i >= 0; i--) {
+            header->checksum[i] = (checksum % 8) + '0';
+            checksum /= 8;
+        }
+
+        // 复制文件数据
+        memcpy(header->data, file->data, file->size);
+        off += align_up(sizeof(struct tar_header) + file->size, SECTOR_SIZE);
+    }
+
+    // 将 `disk` 缓冲区写入 virtio-blk
+    for (unsigned sector = 0; sector < sizeof(disk) / SECTOR_SIZE; sector++)
+        read_write_disk(&disk[sector * SECTOR_SIZE], sector, true);
+
+    printf("wrote %d bytes to disk\n", sizeof(disk));
+}
+
+
 void kernel_main(void) {
     memset(__bss, 0, (size_t) __bss_end - (size_t) __bss);
 
@@ -173,12 +399,12 @@ void kernel_main(void) {
     // paddr_t paddr1 = alloc_pages(1);
     // printf("alloc_pages test: paddr0=%x\n", paddr0);
     // printf("alloc_pages test: paddr1=%x\n", paddr1);
-
     // PANIC("booted!");
 
     printf("\n\n");
     WRITE_CSR(stvec, (uint32_t)kernel_entry); // 新增
-    
+    virtio_blk_init(); // new
+    fs_init();
 
     idle_proc = create_process(NULL, 0); // 已更新!
     idle_proc->pid = 0; // idle
@@ -189,9 +415,20 @@ void kernel_main(void) {
     // proc_a = create_process((uint32_t) proc_a_entry);
     // proc_b = create_process((uint32_t) proc_b_entry);
     // proc_a_entry();
+
+    // 测试 磁盘读写
+    // char buf[SECTOR_SIZE];
+    // read_write_disk(buf, 0, false /* 从磁盘读取 */);
+    // printf("first sector: %s\n", buf);
+    // strcpy(buf, "hello from kernel!!!\n");
+    // read_write_disk(buf, 0, true /* 写入磁盘 */);
+
     
     yield();
     PANIC("switched to idle process");
+
+
+
 
     // __asm__ __volatile__("unimp"); // 新增
 
@@ -246,12 +483,12 @@ __attribute__((naked)) void switch_context(uint32_t *prev_sp,
 // ↓ __attribute__((naked)) 非常重要!
 __attribute__((naked)) void user_entry(void) {
     __asm__ __volatile__(
-        "csrw sepc, %[sepc]        \n"
-        "csrw sstatus, %[sstatus]  \n"
-        "sret                      \n"
+        "csrw sepc, %[sepc]\n"
+        "csrw sstatus, %[sstatus]\n"
+        "sret\n"
         :
         : [sepc] "r" (USER_BASE),
-          [sstatus] "r" (SSTATUS_SPIE)
+          [sstatus] "r" (SSTATUS_SPIE | SSTATUS_SUM)
     );
 }
 
@@ -372,6 +609,21 @@ void handle_trap(struct trap_frame *f) {
     WRITE_CSR(sepc, user_pc);
 }
 
+// 从控制台读取字符
+struct file *fs_lookup(const char *filename) {
+    // 遍历文件系统中的所有文件槽位
+    for (int i = 0; i < FILES_MAX; i++) {
+        struct file *file = &files[i];
+        // 比较当前文件槽位中的文件名与目标文件名
+        if (!strcmp(file->name, filename))
+            // 如果文件名匹配，返回该文件指针
+            return file;
+    }
+
+    // 如果没有找到匹配的文件，返回NULL
+    return NULL;
+}
+
 void handle_syscall(struct trap_frame *f) {
     switch (f->a3) {
         case SYS_GETCHAR:
@@ -393,6 +645,32 @@ void handle_syscall(struct trap_frame *f) {
             current_proc->state = PROC_EXITED;
             yield();
             PANIC("unreachable");
+            case SYS_READFILE:
+            case SYS_WRITEFILE: {
+                const char *filename = (const char *) f->a0;
+                char *buf = (char *) f->a1;
+                int len = f->a2;
+                struct file *file = fs_lookup(filename);
+                if (!file) {
+                    printf("file not found: %s\n", filename);
+                    f->a0 = -1;
+                    break;
+                }
+    
+                if (len > (int) sizeof(file->data))
+                    len = file->size;
+    
+                if (f->a3 == SYS_WRITEFILE) {
+                    memcpy(file->data, buf, len);
+                    file->size = len;
+                    fs_flush();
+                } else {
+                    memcpy(buf, file->data, len);
+                }
+    
+                f->a0 = len;
+                break;
+            }
         default:
             PANIC("unexpected syscall a3=%x\n", f->a3);
     }
